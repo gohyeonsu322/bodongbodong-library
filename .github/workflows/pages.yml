@@ -1,0 +1,92 @@
+name: Publish Bodongbodong
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v6
+      - name: Prepare the game library
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import json, os, shutil, stat, zipfile
+
+          output = Path("_site")
+          if output.exists():
+              shutil.rmtree(output)
+          output.mkdir()
+          expected = ['website-01.zip', 'website-02.zip', 'website-03.zip']
+          for name in expected:
+              if not Path(name).is_file():
+                  raise RuntimeError("Upload the missing file: " + name)
+              with zipfile.ZipFile(name) as archive:
+                  for item in archive.infolist():
+                      relative = PurePosixPath(item.filename)
+                      if relative.is_absolute() or ".." in relative.parts:
+                          raise RuntimeError("Invalid archive path")
+                      if not relative.parts or relative.parts[0] in {".git", ".github", "owner", "private", "project"}:
+                          raise RuntimeError("Unexpected private or source file")
+                      if stat.S_ISLNK(item.external_attr >> 16):
+                          raise RuntimeError("Symbolic links are not supported")
+                      target = output.joinpath(*relative.parts)
+                      if item.is_dir():
+                          target.mkdir(parents=True, exist_ok=True)
+                      else:
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          target.write_bytes(archive.read(item))
+
+          for name in ("catalog.json", "admin-state.enc.json"):
+              if not Path(name).is_file():
+                  raise RuntimeError("Upload the missing file: " + name)
+              shutil.copyfile(name, output / name)
+
+          uploads = Path("assets")
+          if uploads.exists():
+              if any(p.is_symlink() for p in uploads.rglob("*")):
+                  raise RuntimeError("Symbolic links are not supported")
+              shutil.copytree(uploads, output / "assets", dirs_exist_ok=True)
+
+          owner, repository = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+          branch = os.environ.get("GITHUB_REF_NAME", "main")
+          (output / "site-config.json").write_text(json.dumps({"owner": owner, "repo": repository, "branch": branch}), encoding="utf-8")
+
+          catalog = json.loads((output / "catalog.json").read_text(encoding="utf-8"))
+          if not isinstance(catalog.get("games"), list) or not catalog["games"]:
+              raise RuntimeError("The game catalog is missing")
+          if not (output / "index.html").is_file() or not (output / "admin/index.html").is_file():
+              raise RuntimeError("The site files are missing")
+          for game in catalog["games"]:
+              photos = [game.get("image", "")] + [p.get("image", "") for p in game.get("gallery", [])]
+              for photo in photos:
+                  if photo.startswith("assets/") and not (output / photo).is_file():
+                      raise RuntimeError("Missing photo: " + photo)
+          print("Prepared", len(catalog["games"]), "games for publication.")
+          PY
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Publish site
+        id: deployment
+        uses: actions/deploy-pages@v4
